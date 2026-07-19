@@ -126,6 +126,17 @@ pub fn main_loop() -> i32 {
     let frame_snapshot = std::sync::Arc::new(std::sync::Mutex::new(
         control_server::FrameSnapshot::default(),
     ));
+    // Seed a black startup frame (the Agon screen before MOS draws) so
+    // /screenshot is valid immediately — the VDP's first real frame doesn't
+    // arrive until ~0.5s into MOS boot, and copyVgaFramebuffer blocks until
+    // then. The render loop replaces this once real frames flow.
+    if control_port.is_some() {
+        if let Ok(mut snap) = frame_snapshot.lock() {
+            snap.width = 640;
+            snap.height = 480;
+            snap.rgb = vec![0u8; 640 * 480 * 3];
+        }
+    }
 
     let debugger_con = if args.debugger {
         let _ez80_paused = ez80_paused.clone();
@@ -144,10 +155,11 @@ pub fn main_loop() -> i32 {
         })
     } else if let Some(port) = control_port {
         let frame = frame_snapshot.clone();
+        let paused = ez80_paused.clone();
         let _control_thread = thread::Builder::new()
             .name("control".to_string())
             .spawn(move || {
-                control_server::start(port, frame, tx_cmd_debugger, rx_resp_debugger);
+                control_server::start(port, frame, paused, tx_cmd_debugger, rx_resp_debugger);
             });
         Some(DebuggerConnection {
             tx: tx_resp_debugger,
@@ -703,7 +715,11 @@ pub fn main_loop() -> i32 {
                         );
                     }
 
-                    // Refresh the headless control server's screenshot buffer.
+                    // Refresh the headless control server's screenshot buffer,
+                    // and advance the SPEC frame counter + step budget. Counting
+                    // only while the budget is non-zero keeps /status.frame stable
+                    // while paused and makes /step advance by exactly N (the CPU
+                    // gate is ez80_paused, halted when the budget reaches 0).
                     if control_port.is_some() {
                         if let Ok(mut snap) = frame_snapshot.lock() {
                             let n = (w * h * 3) as usize;
@@ -711,6 +727,16 @@ pub fn main_loop() -> i32 {
                             snap.height = h;
                             snap.rgb.resize(n, 0);
                             snap.rgb.copy_from_slice(&vgabuf[..n]);
+                            if snap.budget != 0 {
+                                snap.frame += 1;
+                                if snap.budget > 0 {
+                                    snap.budget -= 1;
+                                    if snap.budget == 0 {
+                                        ez80_paused
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                            }
                         }
                     }
                 }

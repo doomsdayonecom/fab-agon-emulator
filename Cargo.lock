@@ -185,6 +185,7 @@ version = "1.2.2"
 dependencies = [
  "agon-ez80-emulator",
  "agon-light-emulator-debugger",
+ "ez80",
  "home",
  "libloading",
  "pico-args",

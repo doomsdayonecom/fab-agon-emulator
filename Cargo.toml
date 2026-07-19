@@ -26,6 +26,9 @@ sdl3-sys = "*"
 pico-args = "0.5.0"
 agon-ez80-emulator = { workspace = true }
 agon-light-emulator-debugger = { workspace = true }
+# Same rev as agon-ez80-emulator: lets the control server format eZ80 registers
+# (ez80::Reg16) for the /regs endpoint (retro-remote-debug-controller SPEC 0.1).
+ez80 = { git = "https://github.com/tomm/ez80.git", rev = "0cc736392919c647995c0ac6a153e4aaef56f3f2" }
 libloading = "0.8.0"
 home = "0.5.9"
 serialport = "4.3.0"
