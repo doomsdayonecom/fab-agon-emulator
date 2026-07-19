@@ -27,6 +27,7 @@ OPTIONS:
   -u, --unlimited-cpu   Don't limit eZ80 CPU frequency
 
 ADVANCED:
+  --control-port <port> Headless test-control HTTP server (screenshots + memory)
   --ram-size <KiB>      Set a non-standard RAM size (default is 512KiB)
   --mos PATH            Use a different MOS.bin firmware
   --precise-interrupts  Process interrupts and EZ80 hardware every cycle
@@ -88,6 +89,8 @@ pub struct AppArgs {
     pub swap_caps_and_ctrl: bool,
     pub precise_interrupts: bool,
     pub ram_size: u32,
+    /// Opt-in headless test-control HTTP server port (see src/control_server.rs).
+    pub control_port: Option<u16>,
 }
 
 pub fn parse_args() -> Result<AppArgs, pico_args::Error> {
@@ -114,6 +117,7 @@ pub fn parse_args() -> Result<AppArgs, pico_args::Error> {
     let args = AppArgs {
         sdcard: pargs.opt_value_from_str("--sdcard")?,
         sdcard_img: pargs.opt_value_from_str("--sdcard-img")?,
+        control_port: pargs.opt_value_from_str("--control-port")?,
         debugger: pargs.contains(["-d", "--debugger"]),
         breakpoints: pargs.values_from_fn(
             ["-b", "--breakpoint"],

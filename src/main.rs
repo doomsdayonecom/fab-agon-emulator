@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::thread;
 mod ascii2vk;
 mod audio;
+mod control_server;
 mod ez80_serial_links;
 mod joypad;
 mod parse_args;
@@ -118,6 +119,14 @@ pub fn main_loop() -> i32 {
     }
     */
 
+    // Headless control server (--control-port): shares this framebuffer
+    // snapshot with the render loop below, and drives the debugger command
+    // channel for memory/register reads.
+    let control_port = args.control_port;
+    let frame_snapshot = std::sync::Arc::new(std::sync::Mutex::new(
+        control_server::FrameSnapshot::default(),
+    ));
+
     let debugger_con = if args.debugger {
         let _ez80_paused = ez80_paused.clone();
         let _emulator_shutdown = emulator_shutdown.clone();
@@ -129,6 +138,17 @@ pub fn main_loop() -> i32 {
                 _ez80_paused.load(std::sync::atomic::Ordering::Relaxed),
             );
         });
+        Some(DebuggerConnection {
+            tx: tx_resp_debugger,
+            rx: rx_cmd_debugger,
+        })
+    } else if let Some(port) = control_port {
+        let frame = frame_snapshot.clone();
+        let _control_thread = thread::Builder::new()
+            .name("control".to_string())
+            .spawn(move || {
+                control_server::start(port, frame, tx_cmd_debugger, rx_resp_debugger);
+            });
         Some(DebuggerConnection {
             tx: tx_resp_debugger,
             rx: rx_cmd_debugger,
@@ -681,6 +701,17 @@ pub fn main_loop() -> i32 {
                             &mut vgabuf[0] as *mut u8,
                             &mut frame_rate_hz as *mut f32,
                         );
+                    }
+
+                    // Refresh the headless control server's screenshot buffer.
+                    if control_port.is_some() {
+                        if let Ok(mut snap) = frame_snapshot.lock() {
+                            let n = (w * h * 3) as usize;
+                            snap.width = w;
+                            snap.height = h;
+                            snap.rgb.resize(n, 0);
+                            snap.rgb.copy_from_slice(&vgabuf[..n]);
+                        }
                     }
                 }
 
