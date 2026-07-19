@@ -137,6 +137,11 @@ pub fn main_loop() -> i32 {
             snap.rgb = vec![0u8; 640 * 480 * 3];
         }
     }
+    // Control-server key injections (SPEC /key): the control thread pushes
+    // (fabgl vkey, isDown) pairs; the render loop drains them so fabgl key
+    // events are delivered on the same thread as normal keyboard input.
+    let key_queue: control_server::KeyQueue =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let debugger_con = if args.debugger {
         let _ez80_paused = ez80_paused.clone();
@@ -156,10 +161,14 @@ pub fn main_loop() -> i32 {
     } else if let Some(port) = control_port {
         let frame = frame_snapshot.clone();
         let paused = ez80_paused.clone();
+        let keys = key_queue.clone();
+        let reset = soft_reset.clone();
         let _control_thread = thread::Builder::new()
             .name("control".to_string())
             .spawn(move || {
-                control_server::start(port, frame, paused, tx_cmd_debugger, rx_resp_debugger);
+                control_server::start(
+                    port, frame, paused, keys, reset, tx_cmd_debugger, rx_resp_debugger,
+                );
             });
         Some(DebuggerConnection {
             tx: tx_resp_debugger,
@@ -455,6 +464,18 @@ pub fn main_loop() -> i32 {
             // signal vblank to VDP
             unsafe {
                 (*vdp_interface.signal_vblank)();
+            }
+
+            // Deliver any control-server key injections (SPEC /key) here, on the
+            // main thread where fabgl keyboard events are normally sent.
+            if control_port.is_some() {
+                if let Ok(mut q) = key_queue.lock() {
+                    for (vk, down) in q.drain(..) {
+                        unsafe {
+                            (*vdp_interface.sendVKeyEventToFabgl)(vk, down);
+                        }
+                    }
+                }
             }
 
             // shutdown if requested (atomic could be set from the debugger)

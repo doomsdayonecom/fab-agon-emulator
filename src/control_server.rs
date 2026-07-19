@@ -16,6 +16,8 @@
 //!   GET  /regs                   eZ80 registers, ADL (JSON)
 //!   POST /step?frames=N          advance N frames then halt -> {"frame":N}
 //!   POST /pause | /resume        halt / free-run -> {"paused":bool}
+//!   POST /key?text=c|code=vk[&down=0|1]   inject a key (0.2); no down = tap
+//!   POST /reset                  soft reset (0.2)
 //!
 //! Determinism (SPEC): a monotonic frame counter + a run budget live on the
 //! render thread (where the screenshot snapshot is already published); the CPU
@@ -24,6 +26,7 @@
 //! the CPU when the budget hits 0. Reads (/mem, /regs) marshal to the eZ80
 //! thread over the existing debugger command channel, so they're consistent.
 
+use crate::ascii2vk::ascii2vk;
 use crate::{DebugCmd, DebugResp};
 use ez80::Reg16;
 use std::io::{Read, Write};
@@ -33,7 +36,12 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const CONTRACT: &str = "0.1.0";
+const CONTRACT: &str = "0.2.0";
+
+/// A queued key injection (fabgl virtual key, isDown). The control thread
+/// pushes; the render/main thread drains and calls sendVKeyEventToFabgl, so
+/// fabgl key events are always delivered on the same thread as normal input.
+pub type KeyQueue = Arc<Mutex<Vec<(u32, u8)>>>;
 const PLATFORM: &str = "agon";
 const EMULATOR: &str = "fab-agon-emulator";
 const CMD_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -64,6 +72,8 @@ pub fn start(
     port: u16,
     frame: Arc<Mutex<FrameSnapshot>>,
     ez80_paused: Arc<AtomicBool>,
+    keys: KeyQueue,
+    soft_reset: Arc<AtomicBool>,
     tx_cmd: Sender<DebugCmd>,
     rx_resp: Receiver<DebugResp>,
 ) {
@@ -75,11 +85,11 @@ pub fn start(
         }
     };
     eprintln!(
-        "[control] listening on http://127.0.0.1:{}  (SPEC {} — /status /screenshot /mem /regs /step /pause /resume)",
+        "[control] listening on http://127.0.0.1:{}  (SPEC {} — /status /screenshot /mem /regs /step /pause /resume /key /reset)",
         port, CONTRACT
     );
     for stream in listener.incoming().flatten() {
-        handle(stream, &frame, &ez80_paused, &tx_cmd, &rx_resp);
+        handle(stream, &frame, &ez80_paused, &keys, &soft_reset, &tx_cmd, &rx_resp);
     }
 }
 
@@ -87,6 +97,8 @@ fn handle(
     mut stream: TcpStream,
     frame: &Arc<Mutex<FrameSnapshot>>,
     ez80_paused: &Arc<AtomicBool>,
+    keys: &KeyQueue,
+    soft_reset: &Arc<AtomicBool>,
     tx_cmd: &Sender<DebugCmd>,
     rx_resp: &Receiver<DebugResp>,
 ) {
@@ -204,9 +216,42 @@ fn handle(
             ez80_paused.store(false, Ordering::Relaxed);
             respond(&mut stream, 200, "application/json; charset=utf-8", b"{\"paused\":false}");
         }
+        ("POST", "/key") => {
+            // Resolve a fabgl virtual key from ?code=<vk> or ?text=<char>.
+            let vk = match query_int(query, "code") {
+                Some(code) => code,
+                None => match query_str(query, "text").and_then(|t| t.chars().next()) {
+                    Some(c) => ascii2vk(c),
+                    None => {
+                        json_error(&mut stream, 400, "usage: /key?text=<char>|code=<vk>[&down=0|1]");
+                        return;
+                    }
+                },
+            };
+            if vk == 0 {
+                json_error(&mut stream, 400, "unmapped key");
+                return;
+            }
+            // down=1 press, down=0 release, omitted = tap (press then release).
+            // The render thread drains this queue and delivers to fabgl.
+            let mut q = keys.lock().unwrap();
+            match query_int(query, "down") {
+                Some(0) => q.push((vk, 0)),
+                Some(_) => q.push((vk, 1)),
+                None => {
+                    q.push((vk, 1));
+                    q.push((vk, 0));
+                }
+            }
+            respond(&mut stream, 200, "application/json; charset=utf-8", b"{\"injected\":true}");
+        }
+        ("POST", "/reset") => {
+            soft_reset.store(true, Ordering::Relaxed);
+            respond(&mut stream, 200, "application/json; charset=utf-8", b"{\"reset\":true}");
+        }
         // Known path, wrong method -> 405; anything else -> 404.
         (_, "/status") | (_, "/screenshot") | (_, "/mem") | (_, "/regs")
-        | (_, "/step") | (_, "/pause") | (_, "/resume") => {
+        | (_, "/step") | (_, "/pause") | (_, "/resume") | (_, "/key") | (_, "/reset") => {
             json_error(&mut stream, 405, "method not allowed")
         }
         _ => json_error(&mut stream, 404, "not found"),
@@ -237,11 +282,15 @@ fn recv_until(rx: &Receiver<DebugResp>, pred: impl Fn(&DebugResp) -> bool) -> Op
 }
 
 fn query_int(query: &str, key: &str) -> Option<u32> {
+    query_str(query, key).and_then(parse_int)
+}
+
+fn query_str<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query
         .split('&')
         .filter_map(|pair| pair.split_once('='))
         .find(|(k, _)| *k == key)
-        .and_then(|(_, v)| parse_int(v))
+        .map(|(_, v)| v)
 }
 
 fn parse_int(s: &str) -> Option<u32> {
