@@ -42,6 +42,11 @@ const CONTRACT: &str = "0.2.0";
 /// pushes; the render/main thread drains and calls sendVKeyEventToFabgl, so
 /// fabgl key events are always delivered on the same thread as normal input.
 pub type KeyQueue = Arc<Mutex<Vec<(u32, u8)>>>;
+/// Rolling capture of the VDP's generated audio (u8 PCM, mono, 16384 Hz). The
+/// SDL audio callback appends every block it drains from getAudioSamples; the
+/// /audio endpoint drains this buffer. Bounded by the callback so it never
+/// grows without limit when no one is reading.
+pub type AudioCapture = Arc<Mutex<Vec<u8>>>;
 const PLATFORM: &str = "agon";
 const EMULATOR: &str = "fab-agon-emulator";
 const CMD_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -76,6 +81,7 @@ pub fn start(
     soft_reset: Arc<AtomicBool>,
     tx_cmd: Sender<DebugCmd>,
     rx_resp: Receiver<DebugResp>,
+    audio: AudioCapture,
 ) {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
@@ -85,11 +91,11 @@ pub fn start(
         }
     };
     eprintln!(
-        "[control] listening on http://127.0.0.1:{}  (SPEC {} — /status /screenshot /mem /regs /step /pause /resume /key /reset)",
+        "[control] listening on http://127.0.0.1:{}  (SPEC {} — /status /screenshot /mem /regs /step /pause /resume /key /reset /audio)",
         port, CONTRACT
     );
     for stream in listener.incoming().flatten() {
-        handle(stream, &frame, &ez80_paused, &keys, &soft_reset, &tx_cmd, &rx_resp);
+        handle(stream, &frame, &ez80_paused, &keys, &soft_reset, &tx_cmd, &rx_resp, &audio);
     }
 }
 
@@ -101,6 +107,7 @@ fn handle(
     soft_reset: &Arc<AtomicBool>,
     tx_cmd: &Sender<DebugCmd>,
     rx_resp: &Receiver<DebugResp>,
+    audio: &AudioCapture,
 ) {
     let mut buf = [0u8; 2048];
     let n = match stream.read(&mut buf) {
@@ -133,6 +140,16 @@ fn handle(
             let mut body = format!("P6\n{} {}\n255\n", f.width, f.height).into_bytes();
             body.extend_from_slice(&f.rgb);
             respond(&mut stream, 200, "image/x-portable-pixmap", &body);
+        }
+        ("GET", "/audio") => {
+            // Drain the rolling capture: the VDP's generated audio since the
+            // last read (u8 PCM, mono, 16384 Hz). Empty body = silence/no
+            // audio callback (headless needs SDL_AUDIODRIVER=dummy).
+            let data = {
+                let mut cap = audio.lock().unwrap();
+                std::mem::take(&mut *cap)
+            };
+            respond(&mut stream, 200, "application/octet-stream", &data);
         }
         ("GET", "/mem") => match (query_int(query, "addr"), query_int(query, "len")) {
             // bank is tolerated and ignored (Agon is flat 24-bit). len==0 is valid.

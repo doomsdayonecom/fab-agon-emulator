@@ -143,6 +143,11 @@ pub fn main_loop() -> i32 {
     let key_queue: control_server::KeyQueue =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    // Rolling capture of the VDP's generated audio, teed by the SDL audio
+    // callback and drained by the control server's /audio endpoint.
+    let audio_capture: control_server::AudioCapture =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
     let debugger_con = if args.debugger {
         let _ez80_paused = ez80_paused.clone();
         let _emulator_shutdown = emulator_shutdown.clone();
@@ -163,11 +168,12 @@ pub fn main_loop() -> i32 {
         let paused = ez80_paused.clone();
         let keys = key_queue.clone();
         let reset = soft_reset.clone();
+        let audio = audio_capture.clone();
         let _control_thread = thread::Builder::new()
             .name("control".to_string())
             .spawn(move || {
                 control_server::start(
-                    port, frame, paused, keys, reset, tx_cmd_debugger, rx_resp_debugger,
+                    port, frame, paused, keys, reset, tx_cmd_debugger, rx_resp_debugger, audio,
                 );
             });
         Some(DebuggerConnection {
@@ -320,6 +326,7 @@ pub fn main_loop() -> i32 {
             audio::VdpAudioStream {
                 buffer: vec![],
                 getAudioSamples: vdp_interface.getAudioSamples,
+                capture: audio_capture.clone(),
             },
         )?;
 
