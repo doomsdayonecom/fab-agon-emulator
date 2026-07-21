@@ -1,6 +1,6 @@
 //! Headless HTTP control server for automated testing.
 //!
-//! Conforms to the **Retro Remote Debug Controller** contract, SPEC.md 0.1.0
+//! Conforms to the **Retro Remote Debug Controller** contract, SPEC.md 0.3.0
 //! (github doomsdayonecom/retro-remote-debug-controller), so ONE shared pytest
 //! client (`client/emu_control.py`) drives the FAB Agon emulator, the X16
 //! emulator and the Neo6502 emulator identically. FAB is Rust, so it does not
@@ -13,7 +13,9 @@
 //!   GET  /status                 contract/platform/frame/paused/running (JSON)
 //!   GET  /screenshot             PPM (P6) of the live VGA framebuffer
 //!   GET  /mem?addr=&len=[&bank=]  raw eZ80 RAM bytes (bank tolerated + ignored)
+//!   POST /mem?addr=[&bank=]       poke the request body's bytes (0.3)
 //!   GET  /regs                   eZ80 registers, ADL (JSON)
+//!   GET  /audio                  VDP audio since last call as a PCM WAV (0.3)
 //!   POST /step?frames=N          advance N frames then halt -> {"frame":N}
 //!   POST /pause | /resume        halt / free-run -> {"paused":bool}
 //!   POST /key?text=c|code=vk[&down=0|1]   inject a key (0.2); no down = tap
@@ -36,17 +38,27 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const CONTRACT: &str = "0.2.0";
+const CONTRACT: &str = "0.3.0";
+/// RRDC audio native format (the Agon VDP mixes 8-bit unsigned mono @16384 Hz).
+const AUDIO_RATE: u32 = 16384;
+const AUDIO_CHANNELS: u16 = 1;
+/// POST /mem body cap (matches the /mem read cap).
+const MEM_CAP: usize = 0x10000;
 
 /// A queued key injection (fabgl virtual key, isDown). The control thread
 /// pushes; the render/main thread drains and calls sendVKeyEventToFabgl, so
 /// fabgl key events are always delivered on the same thread as normal input.
 pub type KeyQueue = Arc<Mutex<Vec<(u32, u8)>>>;
-/// Rolling capture of the VDP's generated audio (u8 PCM, mono, 16384 Hz). The
-/// SDL audio callback appends every block it drains from getAudioSamples; the
-/// /audio endpoint drains this buffer. Bounded by the callback so it never
-/// grows without limit when no one is reading.
-pub type AudioCapture = Arc<Mutex<Vec<u8>>>;
+/// Rolling capture of the VDP's generated audio (u8 PCM, mono, 16384 Hz), plus a
+/// count of samples the ring dropped (oldest-first) on overflow since the last
+/// drain. The SDL audio callback appends every block it drains from
+/// getAudioSamples; GET /audio drains this and reports the drop count.
+#[derive(Default)]
+pub struct AudioRing {
+    pub samples: Vec<u8>,
+    pub dropped: u32,
+}
+pub type AudioCapture = Arc<Mutex<AudioRing>>;
 const PLATFORM: &str = "agon";
 const EMULATOR: &str = "fab-agon-emulator";
 const CMD_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -142,14 +154,19 @@ fn handle(
             respond(&mut stream, 200, "image/x-portable-pixmap", &body);
         }
         ("GET", "/audio") => {
-            // Drain the rolling capture: the VDP's generated audio since the
-            // last read (u8 PCM, mono, 16384 Hz). Empty body = silence/no
-            // audio callback (headless needs SDL_AUDIODRIVER=dummy).
-            let data = {
+            // RRDC 0.3: drain the VDP audio synthesised since the last call and
+            // return it as a self-describing PCM WAV (16-bit signed, mono,
+            // 16384 Hz). Empty ring => a valid zero-frame WAV. Headless capture
+            // needs SDL_AUDIODRIVER=dummy so the callback runs.
+            let (samples, dropped) = {
                 let mut cap = audio.lock().unwrap();
-                std::mem::take(&mut *cap)
+                let d = cap.dropped;
+                cap.dropped = 0;
+                (std::mem::take(&mut cap.samples), d)
             };
-            respond(&mut stream, 200, "application/octet-stream", &data);
+            let wav = build_wav(&samples);
+            let extra = format!("X-Rrdc-Audio-Dropped: {}\r\n", dropped);
+            respond_ex(&mut stream, 200, "audio/wav", &wav, &extra);
         }
         ("GET", "/mem") => match (query_int(query, "addr"), query_int(query, "len")) {
             // bank is tolerated and ignored (Agon is flat 24-bit). len==0 is valid.
@@ -160,6 +177,19 @@ fn handle(
                 }
             }
             _ => json_error(&mut stream, 400, "usage: /mem?addr=<n>&len=<0..65536>"),
+        },
+        ("POST", "/mem") => match query_int(query, "addr") {
+            // RRDC 0.3: poke the request body's bytes starting at addr.
+            Some(addr) => {
+                let body = read_body(&mut stream, &buf[..n], &req);
+                match write_mem(tx_cmd, rx_resp, addr, &body) {
+                    Some(written) => respond(
+                        &mut stream, 200, "application/json; charset=utf-8",
+                        format!("{{\"written\":{written}}}").as_bytes()),
+                    None => json_error(&mut stream, 504, "mem write timed out"),
+                }
+            }
+            None => json_error(&mut stream, 400, "usage: POST /mem?addr=<n> with raw body bytes"),
         },
         ("GET", "/regs") => {
             if tx_cmd.send(DebugCmd::GetRegisters).is_err() {
@@ -287,6 +317,72 @@ fn read_mem(tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, start: u32, len: u3
     }
 }
 
+/// POST /mem: poke `data` at `start`; returns bytes written.
+fn write_mem(tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, start: u32, data: &[u8]) -> Option<u32> {
+    if data.is_empty() {
+        return Some(0);
+    }
+    tx.send(DebugCmd::SetMemory { start, data: data.to_vec() }).ok()?;
+    match recv_until(rx, |r| matches!(r, DebugResp::MemoryWritten { .. })) {
+        Some(DebugResp::MemoryWritten { written }) => Some(written),
+        _ => None,
+    }
+}
+
+/// Read a POST body: the bytes already past the header boundary in `initial`,
+/// plus however many more the Content-Length header calls for (capped MEM_CAP).
+fn read_body(stream: &mut TcpStream, initial: &[u8], req: &str) -> Vec<u8> {
+    let content_length = req
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MEM_CAP);
+    let hdr_end = initial
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(initial.len());
+    let mut body: Vec<u8> = initial[hdr_end..].to_vec();
+    while body.len() < content_length {
+        let mut chunk = [0u8; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(k) => body.extend_from_slice(&chunk[..k]),
+            Err(_) => break,
+        }
+    }
+    body.truncate(content_length);
+    body
+}
+
+/// Wrap the ring's u8 (unsigned, centred on 128) mono samples as a 16-bit
+/// signed PCM WAV. An empty slice yields a valid zero-frame WAV.
+fn build_wav(samples: &[u8]) -> Vec<u8> {
+    let data_bytes = (samples.len() * 2) as u32;
+    let byte_rate = AUDIO_RATE * AUDIO_CHANNELS as u32 * 2;
+    let mut out = Vec::with_capacity(44 + samples.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&AUDIO_CHANNELS.to_le_bytes());
+    out.extend_from_slice(&AUDIO_RATE.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&(AUDIO_CHANNELS * 2).to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits/sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_bytes.to_le_bytes());
+    for &s in samples {
+        let s16 = ((s as i16) - 128) << 8;
+        out.extend_from_slice(&s16.to_le_bytes());
+    }
+    out
+}
+
 /// Receive responses (skipping unrelated ones) until `pred` matches or timeout.
 fn recv_until(rx: &Receiver<DebugResp>, pred: impl Fn(&DebugResp) -> bool) -> Option<DebugResp> {
     loop {
@@ -324,6 +420,12 @@ fn json_error(stream: &mut TcpStream, code: u16, msg: &str) {
 }
 
 fn respond(stream: &mut TcpStream, code: u16, content_type: &str, body: &[u8]) {
+    respond_ex(stream, code, content_type, body, "");
+}
+
+/// Like `respond`, but `extra` is inserted as additional CRLF-terminated header
+/// line(s) (e.g. `"X-Rrdc-Audio-Dropped: 0\r\n"`).
+fn respond_ex(stream: &mut TcpStream, code: u16, content_type: &str, body: &[u8], extra: &str) {
     let status = match code {
         200 => "200 OK",
         400 => "400 Bad Request",
@@ -336,10 +438,11 @@ fn respond(stream: &mut TcpStream, code: u16, content_type: &str, body: &[u8]) {
         _ => "500 Internal Server Error",
     };
     let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
         status,
         content_type,
-        body.len()
+        body.len(),
+        extra
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body);

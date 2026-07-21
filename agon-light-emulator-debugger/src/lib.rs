@@ -142,6 +142,9 @@ fn print_registers(reg: &Registers, show_full: bool) {
 
 fn handle_debug_resp(resp: &DebugResp, state: &EmuState) {
     match resp {
+        DebugResp::MemoryWritten { written } => {
+            println!("Wrote {} byte(s).", written);
+        }
         DebugResp::Memory { start, data } => {
             let mut pos = *start;
             for chunk in &mut data.chunks(16) {

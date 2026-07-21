@@ -20,12 +20,14 @@ impl AudioCallback<u8> for VdpAudioStream {
             (*self.getAudioSamples)(&mut self.buffer[0] as *mut u8, requested as u32);
         };
 
-        // Tee a copy into the rolling capture for the /audio endpoint.
+        // Tee a copy into the rolling capture for the /audio endpoint, counting
+        // any oldest-first samples dropped on overflow (X-Rrdc-Audio-Dropped).
         if let Ok(mut cap) = self.capture.lock() {
-            cap.extend_from_slice(&self.buffer);
-            if cap.len() > CAPTURE_CAP {
-                let drop = cap.len() - CAPTURE_CAP;
-                cap.drain(0..drop);
+            cap.samples.extend_from_slice(&self.buffer);
+            if cap.samples.len() > CAPTURE_CAP {
+                let drop = cap.samples.len() - CAPTURE_CAP;
+                cap.samples.drain(0..drop);
+                cap.dropped = cap.dropped.saturating_add(drop as u32);
             }
         }
 

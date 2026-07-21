@@ -146,7 +146,7 @@ pub fn main_loop() -> i32 {
     // Rolling capture of the VDP's generated audio, teed by the SDL audio
     // callback and drained by the control server's /audio endpoint.
     let audio_capture: control_server::AudioCapture =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::sync::Arc::new(std::sync::Mutex::new(control_server::AudioRing::default()));
 
     let debugger_con = if args.debugger {
         let _ez80_paused = ez80_paused.clone();

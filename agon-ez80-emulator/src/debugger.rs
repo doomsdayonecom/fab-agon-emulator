@@ -38,6 +38,10 @@ pub enum DebugCmd {
         start: u32,
         len: u32,
     },
+    SetMemory {
+        start: u32,
+        data: Vec<u8>,
+    },
     GetMemoryAtReg {
         reg: Reg16,
         len: u32,
@@ -71,6 +75,9 @@ pub enum DebugResp {
     Memory {
         start: u32,
         data: Vec<u8>,
+    },
+    MemoryWritten {
+        written: u32,
     },
     // (start, disasm, bytes)
     Disassembly {
@@ -320,6 +327,9 @@ impl DebuggerServer {
             DebugCmd::GetMemory { start, len } => {
                 self.send_mem(machine, cpu, *start, *len);
             }
+            DebugCmd::SetMemory { start, data } => {
+                self.write_mem(machine, cpu, *start, data);
+            }
             DebugCmd::GetMemoryAtReg { reg, len } => {
                 let addr = if cpu.registers().adl {
                     cpu.registers().get24(*reg)
@@ -360,6 +370,20 @@ impl DebuggerServer {
         }
 
         self.con.tx.send(DebugResp::Memory { start, data }).unwrap();
+    }
+
+    /// RRDC 0.3 POST /mem: poke bytes at `start` via the CPU write path.
+    fn write_mem(&self, machine: &mut AgonMachine, cpu: &mut ez80::Cpu, start: u32, data: &[u8]) {
+        let mut env = Environment::new(&mut cpu.state, machine);
+        let mut written: u32 = 0;
+        for (i, b) in data.iter().enumerate() {
+            env.poke(start.wrapping_add(i as u32), *b);
+            written += 1;
+        }
+        self.con
+            .tx
+            .send(DebugResp::MemoryWritten { written })
+            .unwrap();
     }
 
     fn send_state(&self, machine: &mut AgonMachine, cpu: &mut ez80::Cpu) {
