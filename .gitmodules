@@ -13,3 +13,6 @@
 [submodule "src/vdp/AgonElectronHAL"]
 	path = src/vdp/AgonElectronHAL
 	url = https://github.com/S0urceror/AgonElectronHAL.git
+[submodule "test/rrdc"]
+	path = test/rrdc
+	url = https://github.com/doomsdayonecom/retro-remote-debug-controller.git

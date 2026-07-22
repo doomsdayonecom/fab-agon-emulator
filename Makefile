@@ -52,6 +52,16 @@ cargo-clean:
 
 clean: vdp-clean cargo-clean
 
+# Self-certify the control server against the Retro Remote Debug Controller
+# contract (vendored at test/rrdc). Boots THIS build headless and runs the
+# shared conformance suite over its HTTP surface. Needs the emulator + VDP
+# already built (make all) and python3 + pytest. See test/rrdc/SPEC.md.
+conformance:
+	SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
+	RRDC_EMU_CMD="$(CURDIR)/fab-agon-emulator --sdcard $(CURDIR)/sdcard --mos $(CURDIR)/firmware/mos_console8.bin --vdp $(CURDIR)/firmware/vdp_console8.so --control-port {port}" \
+	RRDC_BOOT_TIMEOUT=60 \
+	python3 -m pytest test/rrdc/conformance -v
+
 depends:
 	$(MAKE) -C src/vdp depends
 
