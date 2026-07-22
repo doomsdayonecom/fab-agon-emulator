@@ -143,6 +143,12 @@ pub fn main_loop() -> i32 {
     let key_queue: control_server::KeyQueue =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    // Control-server pointer injections (SPEC /pointer): the control thread
+    // pushes raw PS/2 mouse packets; the render loop drains them into
+    // sendHostMouseEventToFabgl, the same device path host mouse motion uses.
+    let mouse_queue: control_server::MouseQueue =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
     // Rolling capture of the VDP's generated audio, teed by the SDL audio
     // callback and drained by the control server's /audio endpoint.
     let audio_capture: control_server::AudioCapture =
@@ -167,13 +173,15 @@ pub fn main_loop() -> i32 {
         let frame = frame_snapshot.clone();
         let paused = ez80_paused.clone();
         let keys = key_queue.clone();
+        let mice = mouse_queue.clone();
         let reset = soft_reset.clone();
         let audio = audio_capture.clone();
         let _control_thread = thread::Builder::new()
             .name("control".to_string())
             .spawn(move || {
                 control_server::start(
-                    port, frame, paused, keys, reset, tx_cmd_debugger, rx_resp_debugger, audio,
+                    port, frame, paused, keys, mice, reset, tx_cmd_debugger, rx_resp_debugger,
+                    audio,
                 );
             });
         Some(DebuggerConnection {
@@ -480,6 +488,15 @@ pub fn main_loop() -> i32 {
                     for (vk, down) in q.drain(..) {
                         unsafe {
                             (*vdp_interface.sendVKeyEventToFabgl)(vk, down);
+                        }
+                    }
+                }
+                // Deliver control-server pointer injections (SPEC /pointer) on
+                // the same thread/frame boundary as keys and host mouse motion.
+                if let Ok(mut q) = mouse_queue.lock() {
+                    for packet in q.drain(..) {
+                        unsafe {
+                            (*vdp_interface.sendHostMouseEventToFabgl)(&packet[0] as *const u8);
                         }
                     }
                 }

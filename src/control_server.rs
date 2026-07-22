@@ -1,6 +1,6 @@
 //! Headless HTTP control server for automated testing.
 //!
-//! Conforms to the **Retro Remote Debug Controller** contract, SPEC.md 0.3.0
+//! Conforms to the **Retro Remote Debug Controller** contract, SPEC.md 0.4.0
 //! (github doomsdayonecom/retro-remote-debug-controller), so ONE shared pytest
 //! client (`client/emu_control.py`) drives the FAB Agon emulator, the X16
 //! emulator and the Neo6502 emulator identically. FAB is Rust, so it does not
@@ -20,6 +20,8 @@
 //!   POST /pause | /resume        halt / free-run -> {"paused":bool}
 //!   POST /key?text=c|code=vk[&down=0|1]   inject a key (0.2); no down = tap
 //!   POST /reset                  soft reset (0.2)
+//!   POST /pointer?x=&y=|dx=&dy=[&buttons=]  inject a pointer move/click (0.4)
+//!   GET  /pointer                current pointer {x,y,buttons} (0.4)
 //!
 //! Determinism (SPEC): a monotonic frame counter + a run budget live on the
 //! render thread (where the screenshot snapshot is already published); the CPU
@@ -38,7 +40,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const CONTRACT: &str = "0.3.0";
+const CONTRACT: &str = "0.4.0";
 /// RRDC audio native format (the Agon VDP mixes 8-bit unsigned mono @16384 Hz).
 const AUDIO_RATE: u32 = 16384;
 const AUDIO_CHANNELS: u16 = 1;
@@ -49,6 +51,22 @@ const MEM_CAP: usize = 0x10000;
 /// pushes; the render/main thread drains and calls sendVKeyEventToFabgl, so
 /// fabgl key events are always delivered on the same thread as normal input.
 pub type KeyQueue = Arc<Mutex<Vec<(u32, u8)>>>;
+/// A queued pointer injection: raw PS/2 mouse packets ([flags, dx, dy, wheel]),
+/// pushed by the control thread and drained by the render/main thread into
+/// `sendHostMouseEventToFabgl` — the same device path host mouse motion uses, so
+/// the injection exercises the real fabgl/VDP mouse rather than a shortcut.
+pub type MouseQueue = Arc<Mutex<Vec<[u8; 4]>>>;
+/// The control server's model of the injected pointer (SPEC /pointer). PS/2
+/// mouse packets are *relative*, so we track the absolute position here to turn
+/// an absolute `x,y` into a delta and to answer `GET /pointer`. Screen coords:
+/// x grows right, y grows down (the VDP/framebuffer convention a test screenshots
+/// against). Lives on the single-threaded accept loop, so no lock needed.
+#[derive(Default)]
+pub struct Pointer {
+    pub x: i32,
+    pub y: i32,
+    pub buttons: u8,
+}
 /// Rolling capture of the VDP's generated audio (u8 PCM, mono, 16384 Hz), plus a
 /// count of samples the ring dropped (oldest-first) on overflow since the last
 /// drain. The SDL audio callback appends every block it drains from
@@ -90,6 +108,7 @@ pub fn start(
     frame: Arc<Mutex<FrameSnapshot>>,
     ez80_paused: Arc<AtomicBool>,
     keys: KeyQueue,
+    mice: MouseQueue,
     soft_reset: Arc<AtomicBool>,
     tx_cmd: Sender<DebugCmd>,
     rx_resp: Receiver<DebugResp>,
@@ -103,11 +122,15 @@ pub fn start(
         }
     };
     eprintln!(
-        "[control] listening on http://127.0.0.1:{}  (SPEC {} — /status /screenshot /mem /regs /step /pause /resume /key /reset /audio)",
+        "[control] listening on http://127.0.0.1:{}  (SPEC {} — /status /screenshot /mem /regs /step /pause /resume /key /reset /audio /pointer)",
         port, CONTRACT
     );
+    // The injected pointer's absolute position persists across requests; the
+    // accept loop is single-threaded so a plain owned value suffices.
+    let mut pointer = Pointer::default();
     for stream in listener.incoming().flatten() {
-        handle(stream, &frame, &ez80_paused, &keys, &soft_reset, &tx_cmd, &rx_resp, &audio);
+        handle(stream, &frame, &ez80_paused, &keys, &mice, &mut pointer,
+               &soft_reset, &tx_cmd, &rx_resp, &audio);
     }
 }
 
@@ -116,6 +139,8 @@ fn handle(
     frame: &Arc<Mutex<FrameSnapshot>>,
     ez80_paused: &Arc<AtomicBool>,
     keys: &KeyQueue,
+    mice: &MouseQueue,
+    pointer: &mut Pointer,
     soft_reset: &Arc<AtomicBool>,
     tx_cmd: &Sender<DebugCmd>,
     rx_resp: &Receiver<DebugResp>,
@@ -296,9 +321,50 @@ fn handle(
             soft_reset.store(true, Ordering::Relaxed);
             respond(&mut stream, 200, "application/json; charset=utf-8", b"{\"reset\":true}");
         }
+        ("POST", "/pointer") => {
+            // RRDC 0.4: inject a pointer move/click through the device path.
+            // Absolute (x,y) is primary; relative (dx,dy) offered too. `buttons`
+            // is a bitmask (bit0 primary, bit1 secondary); omitted = unchanged.
+            let (dx, dy) = match (query_iint(query, "x"), query_iint(query, "y")) {
+                (Some(x), Some(y)) => {
+                    let d = (x - pointer.x, y - pointer.y);
+                    pointer.x = x;
+                    pointer.y = y;
+                    d
+                }
+                _ => match (query_iint(query, "dx"), query_iint(query, "dy")) {
+                    (None, None) => {
+                        json_error(&mut stream, 400,
+                            "usage: /pointer?x=<n>&y=<n> | ?dx=<n>&dy=<n> [&buttons=<mask>]");
+                        return;
+                    }
+                    (odx, ody) => {
+                        let (dx, dy) = (odx.unwrap_or(0), ody.unwrap_or(0));
+                        pointer.x += dx;
+                        pointer.y += dy;
+                        (dx, dy)
+                    }
+                },
+            };
+            // buttons omitted -> hold current state (a pure move); else update it.
+            if let Some(b) = query_int(query, "buttons") {
+                pointer.buttons = (b & 0x07) as u8;
+            }
+            let packets = mouse_packets(dx, dy, pointer.buttons);
+            mice.lock().unwrap().extend(packets);
+            respond(&mut stream, 200, "application/json; charset=utf-8", b"{\"injected\":true}");
+        }
+        ("GET", "/pointer") => {
+            let body = format!(
+                "{{\"x\":{},\"y\":{},\"buttons\":{}}}",
+                pointer.x, pointer.y, pointer.buttons
+            );
+            respond(&mut stream, 200, "application/json; charset=utf-8", body.as_bytes());
+        }
         // Known path, wrong method -> 405; anything else -> 404.
         (_, "/status") | (_, "/screenshot") | (_, "/mem") | (_, "/regs")
-        | (_, "/step") | (_, "/pause") | (_, "/resume") | (_, "/key") | (_, "/reset") => {
+        | (_, "/step") | (_, "/pause") | (_, "/resume") | (_, "/key") | (_, "/reset")
+        | (_, "/pointer") => {
             json_error(&mut stream, 405, "method not allowed")
         }
         _ => json_error(&mut stream, 404, "not found"),
@@ -394,8 +460,45 @@ fn recv_until(rx: &Receiver<DebugResp>, pred: impl Fn(&DebugResp) -> bool) -> Op
     }
 }
 
+/// Turn a screen-space pointer delta into PS/2 mouse packets fabgl accepts
+/// (the exact encoding `main.rs` builds from host mouse motion): byte0 =
+/// 0x08 | buttons | X-sign(0x10) | Y-sign(0x20), byte1 = dx, byte2 = dy as an
+/// int9 with its sign in byte0. Screen y grows down but PS/2 y grows up, so dy
+/// is negated. A single packet carries at most ±127 per axis, so a larger move
+/// is split across several packets (all drained in one vblank → one-frame,
+/// deterministic). A zero delta still emits one packet so a pure button
+/// change (click without moving) is delivered.
+fn mouse_packets(dx: i32, dy: i32, buttons: u8) -> Vec<[u8; 4]> {
+    let flags = 0x08 | (buttons & 0x07);
+    let (mut rx, mut ry) = (dx, -dy); // to PS/2 (y up-positive)
+    let mut out = Vec::new();
+    loop {
+        let sx = rx.clamp(-127, 127);
+        let sy = ry.clamp(-127, 127);
+        let mut p = [flags, sx as u8, sy as u8, 0u8];
+        if sx < 0 {
+            p[0] |= 0x10;
+        }
+        if sy < 0 {
+            p[0] |= 0x20;
+        }
+        out.push(p);
+        rx -= sx;
+        ry -= sy;
+        if rx == 0 && ry == 0 {
+            break;
+        }
+    }
+    out
+}
+
 fn query_int(query: &str, key: &str) -> Option<u32> {
     query_str(query, key).and_then(parse_int)
+}
+
+/// Signed decimal query param (pointer coords/deltas may be negative).
+fn query_iint(query: &str, key: &str) -> Option<i32> {
+    query_str(query, key).and_then(|s| s.trim().parse::<i32>().ok())
 }
 
 fn query_str<'a>(query: &'a str, key: &str) -> Option<&'a str> {
