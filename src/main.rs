@@ -149,6 +149,12 @@ pub fn main_loop() -> i32 {
     let mouse_queue: control_server::MouseQueue =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    // Control-server pad injections (SPEC /pad): the control thread pushes
+    // (port, virtual-pad state); the render loop drains them onto the joystick
+    // GPIO pins, the same read path host joystick input uses.
+    let pad_queue: control_server::PadQueue =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
     // Rolling capture of the VDP's generated audio, teed by the SDL audio
     // callback and drained by the control server's /audio endpoint.
     let audio_capture: control_server::AudioCapture =
@@ -174,14 +180,15 @@ pub fn main_loop() -> i32 {
         let paused = ez80_paused.clone();
         let keys = key_queue.clone();
         let mice = mouse_queue.clone();
+        let pads = pad_queue.clone();
         let reset = soft_reset.clone();
         let audio = audio_capture.clone();
         let _control_thread = thread::Builder::new()
             .name("control".to_string())
             .spawn(move || {
                 control_server::start(
-                    port, frame, paused, keys, mice, reset, tx_cmd_debugger, rx_resp_debugger,
-                    audio,
+                    port, frame, paused, keys, mice, pads, reset, tx_cmd_debugger,
+                    rx_resp_debugger, audio,
                 );
             });
         Some(DebuggerConnection {
@@ -498,6 +505,13 @@ pub fn main_loop() -> i32 {
                         unsafe {
                             (*vdp_interface.sendHostMouseEventToFabgl)(&packet[0] as *const u8);
                         }
+                    }
+                }
+                // Apply control-server pad injections (SPEC /pad) to the joystick
+                // GPIO. A pad is a level, so the pins hold until the next update.
+                if let Ok(mut q) = pad_queue.lock() {
+                    for (index, pad) in q.drain(..) {
+                        joypad::set_virtual_pad(&gpios, index, pad.connected, pad.buttons);
                     }
                 }
             }
