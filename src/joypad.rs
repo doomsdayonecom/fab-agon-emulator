@@ -65,3 +65,31 @@ pub fn on_button(gpios: &GpioSet, joystick_num: u32, button_idx: u8, is_down: bo
     let pin = 4 + (!(joystick_num as u8) & 1) + (button_idx & 1) * 2;
     gpios.d.set_input_pin(pin, !is_down);
 }
+
+/// Drive a joystick port from an RRDC virtual pad (SPEC /pad). `buttons` is the
+/// contract's canonical mask (bit0 LEFT, 1 RIGHT, 2 UP, 3 DOWN, 4 A, 5 B, …);
+/// the Agon DE-9 port is a d-pad + two fire buttons, so LEFT/RIGHT/UP/DOWN map
+/// to the port-C d-pad pins and A/B to the two port-D button pins (the higher
+/// SNES-style buttons have no Agon target and are ignored). Unplugged reads as
+/// idle. Pin selection matches on_hat_motion / on_button so the injected pad
+/// lands on the exact pins host joystick input does.
+pub fn set_virtual_pad(gpios: &GpioSet, port: u32, connected: bool, buttons: u16) {
+    const LEFT: u16 = 0x001;
+    const RIGHT: u16 = 0x002;
+    const UP: u16 = 0x004;
+    const DOWN: u16 = 0x008;
+    const A: u16 = 0x010;
+    const B: u16 = 0x020;
+    // pins are pulled high, so a released input is `true`.
+    let held = |bit: u16| connected && (buttons & bit) != 0;
+
+    let dpad_off = (port as u8) & 1; // matches on_hat_motion's pin_offset
+    gpios.c.set_input_pin(PIN_PORT1_DPAD_UP - dpad_off, !held(UP));
+    gpios.c.set_input_pin(PIN_PORT1_DPAD_RIGHT - dpad_off, !held(RIGHT));
+    gpios.c.set_input_pin(PIN_PORT1_DPAD_DOWN - dpad_off, !held(DOWN));
+    gpios.c.set_input_pin(PIN_PORT1_DPAD_LEFT - dpad_off, !held(LEFT));
+
+    let btn_base = 4 + (!(port as u8) & 1); // matches on_button
+    gpios.d.set_input_pin(btn_base, !held(A)); // button 0
+    gpios.d.set_input_pin(btn_base + 2, !held(B)); // button 1
+}

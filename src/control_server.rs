@@ -1,6 +1,6 @@
 //! Headless HTTP control server for automated testing.
 //!
-//! Conforms to the **Retro Remote Debug Controller** contract, SPEC.md 0.4.0
+//! Conforms to the **Retro Remote Debug Controller** contract, SPEC.md 0.5.0
 //! (github doomsdayonecom/retro-remote-debug-controller), so ONE shared pytest
 //! client (`client/emu_control.py`) drives the FAB Agon emulator, the X16
 //! emulator and the Neo6502 emulator identically. FAB is Rust, so it does not
@@ -22,6 +22,8 @@
 //!   POST /reset                  soft reset (0.2)
 //!   POST /pointer?x=&y=|dx=&dy=[&buttons=]  inject a pointer move/click (0.4)
 //!   GET  /pointer                current pointer {x,y,buttons} (0.4)
+//!   POST /pad?index=[&buttons=][&connected=]  present a virtual controller (0.5)
+//!   GET  /pad?index=             current pad {index,connected,buttons} (0.5)
 //!
 //! Determinism (SPEC): a monotonic frame counter + a run budget live on the
 //! render thread (where the screenshot snapshot is already published); the CPU
@@ -40,7 +42,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const CONTRACT: &str = "0.4.0";
+const CONTRACT: &str = "0.5.0";
 /// RRDC audio native format (the Agon VDP mixes 8-bit unsigned mono @16384 Hz).
 const AUDIO_RATE: u32 = 16384;
 const AUDIO_CHANNELS: u16 = 1;
@@ -67,6 +69,22 @@ pub struct Pointer {
     pub y: i32,
     pub buttons: u8,
 }
+/// A queued virtual-pad update: (port index, new state). The control thread
+/// pushes; the render/main thread drains and drives the joystick GPIO pins, the
+/// same read path host joystick input uses, so an injected pad is indistinguishable
+/// from a physical one to the eZ80.
+pub type PadQueue = Arc<Mutex<Vec<(u32, Pad)>>>;
+/// The control server's model of an injected controller (SPEC /pad). `buttons`
+/// is the contract's canonical mask; the pad is a LEVEL, held until changed, so
+/// this is the authoritative state `GET /pad` reports. The Agon has two DE-9
+/// ports, so two are tracked.
+#[derive(Clone, Copy, Default)]
+pub struct Pad {
+    pub connected: bool,
+    pub buttons: u16,
+}
+/// Number of controller ports the Agon presents (two DE-9 joystick ports).
+const PAD_PORTS: usize = 2;
 /// Rolling capture of the VDP's generated audio (u8 PCM, mono, 16384 Hz), plus a
 /// count of samples the ring dropped (oldest-first) on overflow since the last
 /// drain. The SDL audio callback appends every block it drains from
@@ -109,6 +127,7 @@ pub fn start(
     ez80_paused: Arc<AtomicBool>,
     keys: KeyQueue,
     mice: MouseQueue,
+    pads: PadQueue,
     soft_reset: Arc<AtomicBool>,
     tx_cmd: Sender<DebugCmd>,
     rx_resp: Receiver<DebugResp>,
@@ -122,15 +141,16 @@ pub fn start(
         }
     };
     eprintln!(
-        "[control] listening on http://127.0.0.1:{}  (SPEC {} — /status /screenshot /mem /regs /step /pause /resume /key /reset /audio /pointer)",
+        "[control] listening on http://127.0.0.1:{}  (SPEC {} — /status /screenshot /mem /regs /step /pause /resume /key /reset /audio /pointer /pad)",
         port, CONTRACT
     );
-    // The injected pointer's absolute position persists across requests; the
-    // accept loop is single-threaded so a plain owned value suffices.
+    // Injected input state persists across requests; the accept loop is
+    // single-threaded so plain owned values suffice.
     let mut pointer = Pointer::default();
+    let mut pad_state = [Pad::default(); PAD_PORTS];
     for stream in listener.incoming().flatten() {
         handle(stream, &frame, &ez80_paused, &keys, &mice, &mut pointer,
-               &soft_reset, &tx_cmd, &rx_resp, &audio);
+               &pads, &mut pad_state, &soft_reset, &tx_cmd, &rx_resp, &audio);
     }
 }
 
@@ -141,6 +161,8 @@ fn handle(
     keys: &KeyQueue,
     mice: &MouseQueue,
     pointer: &mut Pointer,
+    pads: &PadQueue,
+    pad_state: &mut [Pad; PAD_PORTS],
     soft_reset: &Arc<AtomicBool>,
     tx_cmd: &Sender<DebugCmd>,
     rx_resp: &Receiver<DebugResp>,
@@ -292,7 +314,9 @@ fn handle(
             // Resolve a fabgl virtual key from ?code=<vk> or ?text=<char>.
             let vk = match query_int(query, "code") {
                 Some(code) => code,
-                None => match query_str(query, "text").and_then(|t| t.chars().next()) {
+                // 0.5: text is percent-encoded by the client so any char
+                // round-trips (e.g. space, '&', '%'); decode before mapping.
+                None => match query_str(query, "text").map(percent_decode).and_then(|t| t.chars().next()) {
                     Some(c) => ascii2vk(c),
                     None => {
                         json_error(&mut stream, 400, "usage: /key?text=<char>|code=<vk>[&down=0|1]");
@@ -361,10 +385,46 @@ fn handle(
             );
             respond(&mut stream, 200, "application/json; charset=utf-8", body.as_bytes());
         }
+        ("POST", "/pad") => {
+            // RRDC 0.5: present a virtual controller and set the held mask.
+            // index defaults to 0; the Agon has two DE-9 ports.
+            let index = query_int(query, "index").unwrap_or(0);
+            if index as usize >= PAD_PORTS {
+                json_error(&mut stream, 400, "controller index out of range (0..1)");
+                return;
+            }
+            let pad = &mut pad_state[index as usize];
+            let buttons = query_int(query, "buttons");
+            if let Some(b) = buttons {
+                pad.buttons = (b & 0x0FFF) as u16; // 12 canonical buttons
+            }
+            // connected: explicit param wins; else giving buttons plugs it in.
+            match query_int(query, "connected") {
+                Some(c) => pad.connected = c != 0,
+                None if buttons.is_some() => pad.connected = true,
+                None => {}
+            }
+            let snapshot = *pad;
+            pads.lock().unwrap().push((index, snapshot));
+            respond(&mut stream, 200, "application/json; charset=utf-8", b"{\"injected\":true}");
+        }
+        ("GET", "/pad") => {
+            let index = query_int(query, "index").unwrap_or(0);
+            if index as usize >= PAD_PORTS {
+                json_error(&mut stream, 400, "controller index out of range (0..1)");
+                return;
+            }
+            let pad = pad_state[index as usize];
+            let body = format!(
+                "{{\"index\":{},\"connected\":{},\"buttons\":{}}}",
+                index, pad.connected, pad.buttons
+            );
+            respond(&mut stream, 200, "application/json; charset=utf-8", body.as_bytes());
+        }
         // Known path, wrong method -> 405; anything else -> 404.
         (_, "/status") | (_, "/screenshot") | (_, "/mem") | (_, "/regs")
         | (_, "/step") | (_, "/pause") | (_, "/resume") | (_, "/key") | (_, "/reset")
-        | (_, "/pointer") => {
+        | (_, "/pointer") | (_, "/pad") => {
             json_error(&mut stream, 405, "method not allowed")
         }
         _ => json_error(&mut stream, 404, "not found"),
@@ -499,6 +559,30 @@ fn query_int(query: &str, key: &str) -> Option<u32> {
 /// Signed decimal query param (pointer coords/deltas may be negative).
 fn query_iint(query: &str, key: &str) -> Option<i32> {
     query_str(query, key).and_then(|s| s.trim().parse::<i32>().ok())
+}
+
+/// Percent-decode a query value (`%XX` byte escapes). 0.5 percent-encodes the
+/// `/key` text so any character survives the query string; the client uses
+/// `quote(safe='')`, which emits `%20` for space rather than `+`, so only
+/// `%XX` needs handling. Invalid escapes pass through unchanged.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) =
+                ((b[i + 1] as char).to_digit(16), (b[i + 2] as char).to_digit(16))
+            {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn query_str<'a>(query: &'a str, key: &str) -> Option<&'a str> {
